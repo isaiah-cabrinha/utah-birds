@@ -1,0 +1,16 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Utah Birds"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: proposal.qmd
+        text: Proposal
+
+format:
+  html:
+    theme: cosmo
