@@ -63,6 +63,25 @@ RAW_DIR = DATA_DIR / "raw"
 AVONET_PATH = DATA_DIR / "AVONET Supplementary dataset 1.xlsx"
 AVONET_SHEET = "AVONET2_eBird"  # eBird taxonomy, closest to iNaturalist's bird names
 
+# iNaturalist follows newer taxonomy than AVONET (2022). These species were
+# renamed or split since then, so map each iNaturalist name to the AVONET
+# name(s) that cover it. The first candidate found in AVONET is used.
+NAME_FIXES = {
+    "Astur cooperii": ["Accipiter cooperii"],                 # Cooper's Hawk
+    "Astur atricapillus": ["Accipiter atricapillus", "Accipiter gentilis"],  # Goshawk (split)
+    "Setophaga aestiva": ["Setophaga petechia"],              # Yellow Warbler (split)
+    "Leuconotopicus villosus": ["Dryobates villosus", "Picoides villosus"],  # Hairy Woodpecker
+    "Tyto furcata": ["Tyto alba"],                            # Barn Owl (split)
+    "Cistothorus paludicola": ["Cistothorus palustris"],      # Marsh Wren (split)
+    "Ardea ibis": ["Bubulcus ibis"],                          # Cattle Egret
+    "Vireo swainsoni": ["Vireo gilvus"],                      # Warbling Vireo (split)
+    "Anarhynchus nivosus": ["Charadrius nivosus"],            # Snowy Plover
+    "Larus smithsonianus": ["Larus argentatus"],              # Herring Gull (split)
+    "Nannus pacificus": ["Troglodytes pacificus", "Nannus pacificus"],  # Pacific Wren
+    "Numenius hudsonicus": ["Numenius phaeopus"],             # Whimbrel (split)
+    "Hesperiphona vespertina": ["Coccothraustes vespertinus"],  # Evening Grosbeak
+}
+
 MIGRATION_LABELS = {1: "sedentary", 2: "partial migrant", 3: "migratory"}
 SEASONS = {12: "winter", 1: "winter", 2: "winter",
            3: "spring", 4: "spring", 5: "spring",
@@ -91,13 +110,38 @@ def fetch_page(year: int, month: int, page: int) -> dict:
         "order_by": "id",
         "order": "asc",
     }
-    response = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    data = response.json()
+    data = get_with_retries(params)
 
     cache_file.write_text(json.dumps(data))
     time.sleep(PAUSE_SECONDS)
     return data
+
+
+def get_with_retries(params: dict, max_attempts: int = 5) -> dict:
+    """GET one page, retrying dropped connections and server errors.
+
+    Waits 5, 10, 20, 40 seconds between attempts so a hiccup doesn't crash
+    the whole run. If the API sends a 429 (too many requests), it waits as
+    long as the Retry-After header asks.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=30)
+            if response.status_code == 429 or response.status_code >= 500:
+                wait = int(response.headers.get("Retry-After", 5 * 2 ** (attempt - 1)))
+                raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
+            response.raise_for_status()
+            return response.json()
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as err:
+            if attempt == max_attempts:
+                raise
+            if not isinstance(err, requests.HTTPError) or err.response is None:
+                wait = 5 * 2 ** (attempt - 1)
+            elif err.response.status_code < 500 and err.response.status_code != 429:
+                raise  # a 4xx like 400/404 won't fix itself, so stop
+            print(f"    {type(err).__name__} on page {params['page']}; "
+                  f"retrying in {wait}s (attempt {attempt}/{max_attempts})")
+            time.sleep(wait)
 
 
 def fetch_month(year: int, month: int) -> list[dict]:
@@ -184,6 +228,20 @@ def load_traits() -> pd.DataFrame:
     return traits.drop(columns="migration_code")
 
 
+def match_avonet_name(name: str, avonet_names: set[str]) -> str:
+    """Return the AVONET name for an iNaturalist species name.
+
+    Uses the name as-is when AVONET has it; otherwise tries each candidate in
+    NAME_FIXES. The scientific_name column keeps iNaturalist's current name.
+    """
+    if name in avonet_names:
+        return name
+    for candidate in NAME_FIXES.get(name, []):
+        if candidate in avonet_names:
+            return candidate
+    return name
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -194,7 +252,12 @@ def main() -> None:
     obs = build_observations(YEAR)
 
     print("Merging AVONET traits...")
-    birds = obs.merge(load_traits(), on="scientific_name", how="left")
+    traits = load_traits()
+    obs["avonet_name"] = obs["scientific_name"].map(
+        lambda name: match_avonet_name(name, set(traits["scientific_name"])))
+    birds = (obs.merge(traits.rename(columns={"scientific_name": "avonet_name"}),
+                       on="avonet_name", how="left")
+                .drop(columns="avonet_name"))
 
     unmatched = (birds.loc[birds["body_mass_g"].isna(), ["scientific_name", "common_name"]]
                  .value_counts().reset_index(name="n_obs"))
